@@ -405,27 +405,104 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "TestPermissionSet_permi
                 data=data,
             )
 
-    @patch("boto3.client")
-    def test_resolve_ou_names(self, mock_boto3_client):
-        # COMMENTED OUT - MOCKING RECURSIVE FUNCTIONS IS REALLY HARD
-        # Mock data for resolve_ou_names()
-        #     mock_boto3_client.list_organizational_units_for_parent.return_value = {
-        #         "OrganizationalUnits": [{"Id": "ou-123"}],
-        #         "NextToken": "token",
-        #     }
+    def build_ou_client(self, children_by_parent):
+        """
+        Builds a mock Organizations client for resolve_ou_names.
 
-        #     # Call the function
-        #     ou_names = resolve_permission_sets_and_assignments.resolve_ou_names(
-        #         "ou-123", mock_boto3_client
-        #     )
+        :param children_by_parent: Maps a parent ID to a list of response pages. Each
+            page is a list of child OU IDs.
+        """
 
-        #     # Assertions
-        #     self.assertEqual(len(ou_names), 1)
-        #     self.assertEqual(ou_names[0]["Id"], "ou-123")
-        #     mock_boto3_client.list_organizational_units_for_parent.assert_called_once_with(
-        #         ParentId="ou-123"
-        #     )
-        pass
+        def list_organizational_units_for_parent(ParentId, NextToken=None):
+            pages = children_by_parent.get(ParentId, [[]])
+            index = int(NextToken) if NextToken else 0
+            response = {
+                "OrganizationalUnits": [{"Id": ou_id} for ou_id in pages[index]]
+            }
+            if index + 1 < len(pages):
+                response["NextToken"] = str(index + 1)
+            return response
+
+        mock_client = MagicMock()
+        mock_client.list_organizational_units_for_parent.side_effect = (
+            list_organizational_units_for_parent
+        )
+        mock_client.describe_organizational_unit.side_effect = (
+            lambda OrganizationalUnitId: {
+                "OrganizationalUnit": {
+                    "Id": OrganizationalUnitId,
+                    "Name": f"name-of-{OrganizationalUnitId}",
+                }
+            }
+        )
+        return mock_client
+
+    def test_resolve_ou_names_walks_every_depth(self):
+        """
+        This recursion is what makes an OU target include every account below the OU,
+        at any depth.
+        """
+        mock_client = self.build_ou_client(
+            {
+                "ou-1234-aaaaaaaa": [["ou-1234-bbbbbbbb"]],
+                "ou-1234-bbbbbbbb": [["ou-1234-cccccccc"]],
+            }
+        )
+
+        result = resolve_permission_sets_and_assignments.resolve_ou_names(
+            "ou-1234-aaaaaaaa", mock_client
+        )
+
+        self.assertEqual(
+            [each_ou["Id"] for each_ou in result],
+            ["ou-1234-aaaaaaaa", "ou-1234-bbbbbbbb", "ou-1234-cccccccc"],
+        )
+        self.assertEqual(result[0]["Name"], "name-of-ou-1234-aaaaaaaa")
+
+    def test_resolve_ou_names_does_not_include_the_root(self):
+        """
+        The root is not an OU, so describe_organizational_unit cannot be called for it.
+        """
+        mock_client = self.build_ou_client({"r-1234": [["ou-1234-aaaaaaaa"]]})
+
+        result = resolve_permission_sets_and_assignments.resolve_ou_names(
+            "r-1234", mock_client
+        )
+
+        self.assertEqual([each_ou["Id"] for each_ou in result], ["ou-1234-aaaaaaaa"])
+        mock_client.describe_organizational_unit.assert_called_once_with(
+            OrganizationalUnitId="ou-1234-aaaaaaaa"
+        )
+
+    def test_resolve_ou_names_reads_every_page_of_children(self):
+        mock_client = self.build_ou_client(
+            {
+                "ou-1234-aaaaaaaa": [
+                    ["ou-1234-bbbbbbbb"],
+                    ["ou-1234-cccccccc"],
+                ],
+            }
+        )
+
+        result = resolve_permission_sets_and_assignments.resolve_ou_names(
+            "ou-1234-aaaaaaaa", mock_client
+        )
+
+        self.assertEqual(
+            [each_ou["Id"] for each_ou in result],
+            ["ou-1234-aaaaaaaa", "ou-1234-bbbbbbbb", "ou-1234-cccccccc"],
+        )
+
+    def test_resolve_ou_names_raises_when_an_ou_cannot_be_described(self):
+        mock_client = self.build_ou_client({})
+        mock_client.describe_organizational_unit.side_effect = Exception("not found")
+
+        with self.assertRaises(Exception) as context:
+            resolve_permission_sets_and_assignments.resolve_ou_names(
+                "ou-1234-aaaaaaaa", mock_client
+            )
+
+        self.assertIn("ou-1234-aaaaaaaa", str(context.exception))
 
     # Mock data for create_permission_set_arn_dict
     @patch("boto3.client")
