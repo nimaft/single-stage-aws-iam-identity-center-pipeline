@@ -479,12 +479,14 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "TestPermissionSet_permi
         # Set the return value for the patched function
         mock_org_client = mock_get_client("organizations")
         mock_boto3_client.return_value = mock_org_client
+        # all_accounts_map maps an account name to a dict of its ID and its tags,
+        # matching what create_assignments_manifest_from_repo_assignments builds.
         accounts_map = {
-            "active_account_in_ou_12345678": "111111111111",
+            "active_account_in_ou_12345678": {"id": "111111111111", "tags": []},
             # commented out as this function now expects only active accounts
-            # "suspended_account_in_ou_12345678": "222222222222",
-            "active_account_in_root": "333333333333",
-            "active_account_in_root_2": "444444444444",
+            # "suspended_account_in_ou_12345678": {"id": "222222222222", "tags": []},
+            "active_account_in_root": {"id": "333333333333", "tags": []},
+            "active_account_in_root_2": {"id": "444444444444", "tags": []},
         }
         ou_accounts_map = {
             "Accounts": [
