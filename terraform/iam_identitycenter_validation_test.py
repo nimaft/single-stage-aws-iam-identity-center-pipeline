@@ -3,7 +3,12 @@ from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 from validation.iam_identitycenter_validation import (
     build_customer_policy_arn,
+    validate_assignment_targets,
+    validate_assignments,
+    validate_customer_managed_policy_paths,
     validate_managed_policies_arn,
+    validate_permission_set_names_are_terraform_identifiers,
+    validate_permission_sets,
     validate_unique_permission_set_name,
 )
 
@@ -197,6 +202,223 @@ class TestValidateManagedPoliciesArn(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertIn("instead of name", result[0])
+
+
+class TestValidatePermissionSetNamesAreTerraformIdentifiers(unittest.TestCase):
+    """
+    The permission set Name is written into six Terraform resource labels and
+    references. A Name that Terraform does not accept gives a generated manifest that
+    does not parse, and that manifest is not in the repository.
+    """
+
+    def test_valid_names(self):
+        templates = {
+            "a.json": {"Name": "MyPermissionSet"},
+            "b.json": {"Name": "_internal"},
+            "c.json": {"Name": "read-only_1"},
+        }
+        self.assertEqual(
+            validate_permission_set_names_are_terraform_identifiers(templates), []
+        )
+
+    def test_invalid_names(self):
+        for name in ["My Permission Set", "my.pset", "1Pset", "-pset", ""]:
+            result = validate_permission_set_names_are_terraform_identifiers(
+                {"bad.json": {"Name": name}}
+            )
+            self.assertEqual(len(result), 1, f"name {name!r}")
+            self.assertIn("bad.json", result[0])
+            self.assertIn(name, result[0])
+
+
+class TestValidateCustomerManagedPolicyPaths(unittest.TestCase):
+    """
+    AWS requires a policy path to start with a slash. It rejects a path without one at
+    apply time, which is after review and after merge.
+    """
+
+    def test_a_plain_policy_name_is_valid(self):
+        template = {"Name": "PSet", "CustomerManagedPolicies": ["myPolicy"]}
+        self.assertEqual(validate_customer_managed_policy_paths(template), [])
+
+    def test_a_path_with_a_leading_slash_is_valid(self):
+        template = {"Name": "PSet", "CustomerManagedPolicies": ["/sso/global/myPolicy"]}
+        self.assertEqual(validate_customer_managed_policy_paths(template), [])
+
+    def test_a_path_without_a_leading_slash_is_rejected(self):
+        template = {"Name": "PSet", "CustomerManagedPolicies": ["sso/global/myPolicy"]}
+        result = validate_customer_managed_policy_paths(template, source_file="p.json")
+        self.assertEqual(len(result), 1)
+        self.assertIn("p.json", result[0])
+        # The message gives the corrected value
+        self.assertIn("/sso/global/myPolicy", result[0])
+
+    def test_an_arn_is_rejected(self):
+        template = {
+            "Name": "PSet",
+            "CustomerManagedPolicies": [
+                "arn:aws:iam::123456789012:policy/sso/myPolicy"
+            ],
+        }
+        self.assertEqual(len(validate_customer_managed_policy_paths(template)), 1)
+
+    def test_boundary_path_without_a_leading_slash_is_rejected(self):
+        template = {
+            "Name": "PSet",
+            "CustomerPermissionBoundary": {"Path": "pbounds/", "Name": "PB"},
+        }
+        result = validate_customer_managed_policy_paths(template)
+        self.assertEqual(len(result), 1)
+        self.assertIn("/pbounds/", result[0])
+
+    def test_boundary_path_with_a_leading_slash_is_valid(self):
+        template = {
+            "Name": "PSet",
+            "CustomerPermissionBoundary": {"Path": "/pbounds/", "Name": "PB"},
+        }
+        self.assertEqual(validate_customer_managed_policy_paths(template), [])
+
+    def test_boundary_without_a_path_is_valid(self):
+        """The resolver uses "/" as the default value for a missing Path."""
+        template = {"Name": "PSet", "CustomerPermissionBoundary": {"Name": "PB"}}
+        self.assertEqual(validate_customer_managed_policy_paths(template), [])
+
+
+class TestValidateAssignmentTargets(unittest.TestCase):
+
+    def base_assignment(self, **overrides):
+        assignment = {
+            "PrincipalId": "SomeGroup",
+            "PrincipalType": "GROUP",
+            "PermissionSetName": "ViewOnlyAccess",
+            "Target": ["111111111111"],
+        }
+        assignment.update(overrides)
+        return assignment
+
+    def test_valid_targets(self):
+        assignment = self.base_assignment(
+            Target=["111111111111", "ou-1234-12345678", "ROOT", "some-account-name"],
+            Exclusions=["222222222222", "SandboxOU"],
+        )
+        self.assertEqual(validate_assignment_targets([assignment]), [])
+
+    def test_an_unquoted_account_id_is_rejected(self):
+        """
+        YAML reads an unquoted account ID as a number and removes any leading zero.
+        This is the defect that the shipped example file held.
+        """
+        result = validate_assignment_targets([self.base_assignment(Target=[11111111111])])
+        self.assertEqual(len(result), 1)
+        self.assertIn("Quote every account ID", result[0])
+
+    def test_a_digit_string_of_the_wrong_length_is_rejected(self):
+        for target in ["11111111111", "1234567890123"]:
+            result = validate_assignment_targets(
+                [self.base_assignment(Target=[target])]
+            )
+            self.assertEqual(len(result), 1, f"target {target}")
+            self.assertIn("exactly 12 digits", result[0])
+
+    def test_a_bad_exclusion_is_rejected(self):
+        result = validate_assignment_targets(
+            [self.base_assignment(Exclusions=[222222222222])]
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("Exclusions", result[0])
+
+    def test_a_missing_or_empty_target_is_rejected(self):
+        for assignment in [
+            {"PrincipalId": "G", "PermissionSetName": "P"},
+            self.base_assignment(Target=[]),
+            self.base_assignment(Target="111111111111"),
+        ]:
+            result = validate_assignment_targets([assignment])
+            self.assertEqual(len(result), 1, f"assignment {assignment}")
+            self.assertIn("Target must be a list", result[0])
+
+
+class TestValidateAssignments(unittest.TestCase):
+
+    def test_reads_the_assignments_key(self):
+        """
+        An earlier version looped over assignment_templates.values(), which held one
+        item: the list itself. That worked only because "Assignments" was the only key.
+        """
+        templates = {
+            "Assignments": [
+                {
+                    "PrincipalId": "SomeGroup",
+                    "PrincipalType": "GROUP",
+                    "PermissionSetName": "ViewOnlyAccess",
+                    "Target": ["111111111111"],
+                }
+            ],
+            "SomeFutureKey": "ignored",
+        }
+
+        self.assertEqual(
+            validate_assignments(templates, management_account_id="999999999999"), []
+        )
+
+    def test_a_malformed_target_gives_an_error_and_does_not_raise(self):
+        """
+        The other assignment checks read Target[0], so a malformed Target raised an
+        IndexError or a KeyError instead of giving the user a message.
+        """
+        templates = {
+            "Assignments": [{"PrincipalId": "G", "PermissionSetName": "P"}]
+        }
+
+        result = validate_assignments(templates, management_account_id="999999999999")
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Target must be a list", result[0])
+
+    def test_a_control_tower_permission_set_is_rejected(self):
+        templates = {
+            "Assignments": [
+                {
+                    "PrincipalId": "SomeGroup",
+                    "PrincipalType": "GROUP",
+                    "PermissionSetName": "AWSAdministratorAccess",
+                    "Target": ["111111111111"],
+                }
+            ]
+        }
+
+        result = validate_assignments(templates, management_account_id="999999999999")
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Control Tower", result[0])
+
+
+class TestValidatePermissionSets(unittest.TestCase):
+
+    @patch("boto3.client")
+    def test_all_the_checks_run(self, mock_boto3_client):
+        """
+        Proves that the new checks are connected to validate_permission_sets, not only
+        that they work when called directly.
+        """
+        mock_iam = MagicMock()
+        mock_iam.get_policy.return_value = {"Policy": {}}
+        mock_boto3_client.return_value = mock_iam
+        templates = {
+            "bad_name.json": {"Name": "my pset", "ManagedPolicies": []},
+            "bad_path.json": {
+                "Name": "GoodName",
+                "CustomerManagedPolicies": ["sso/global/myPolicy"],
+            },
+            "duplicate.json": {"Name": "GoodName", "ManagedPolicies": []},
+        }
+
+        result = validate_permission_sets(templates, current_account_id="123456789012")
+
+        joined = "\n".join(result)
+        self.assertIn("Duplicate Permission Set Names", joined)
+        self.assertIn("Terraform identifier", joined)
+        self.assertIn("does not start with a slash", joined)
 
 
 if __name__ == "__main__":

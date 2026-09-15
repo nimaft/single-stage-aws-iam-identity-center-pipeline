@@ -74,6 +74,7 @@ import validation.iam_identitycenter_validation as iam_identitycenter_validation
 from validation.identifiers import (
     is_aws_account_id,
     is_organization_root_id,
+    is_organizational_unit_id,
     parse_customer_managed_policy_reference,
 )
 import sys
@@ -479,9 +480,26 @@ def list_accounts_in_identifier(
         config=boto_config,
     )
     log.info(f"Resolving {identifier} to a list of accounts")
+    # An AWS account name can be any printable character, and an OU name is nearly as
+    # permissive. Therefore an account or an OU can be named "ROOT", or named to look
+    # exactly like a root ID or an OU ID. Such a name is ambiguous, and the branches
+    # below would read it as an ID, which is the more dangerous reading: for "ROOT" it
+    # grants access to every account in the organization. Refuse to guess.
+    if is_organizational_unit_id(identifier) or is_organization_root_id(identifier) or (
+        "ROOT" == identifier.upper()
+    ):
+        if identifier in all_accounts_map or identifier in all_ous_map:
+            raise Exception(
+                f"The identifier '{identifier}' is the name of an account or an OU, and "
+                "it is also a reserved value or an ID format. Rename the account or the "
+                "OU, or target it by its ID instead."
+            )
     ou_id = None
     # Case for OU ID
-    if re.match(r"ou-", identifier):
+    # NOTE: match the complete OU ID. A test for the "ou-" prefix alone would send an
+    # account name or an OU name that starts with "ou-" to the Organizations API as an
+    # ID. A value that does not match falls through to the name lookup below.
+    if is_organizational_unit_id(identifier):
         ou_id = identifier
     elif re.match(r"^ACCOUNTTAG:", identifier):
         accounts_matching_tag_target = list_accounts_from_tag_target_with_operators(
@@ -673,6 +691,15 @@ def resolve_targets(
         # quoted 12 digit string or a name.
         string_target = str(eachTarget)
         if is_aws_account_id(string_target):
+            # An account name can be 12 digits, so a 12 digit target can name one
+            # account and hold the ID of another. Refuse to guess which one is meant.
+            if string_target in all_accounts_map:
+                raise Exception(
+                    f"The target '{string_target}' is the name of an account, and it is "
+                    "also the format of an account ID. Rename the account, or use the ID "
+                    f"of the account named '{string_target}', which is "
+                    f"{all_accounts_map[string_target]['id']}."
+                )
             account_list.append(string_target)
         # Account names, OUs, and ROOT
         else:
@@ -716,6 +743,27 @@ def resolve_targets(
     return account_list, updated_identifier_cache
 
 
+def get_assignment_resource_name(account: str, assignment: dict) -> str:
+    """
+    Returns the Terraform resource label for an assignment.
+
+    DO NOT change this format. It is the Terraform address of a live resource, so a
+    change makes Terraform destroy and create every assignment, which removes access
+    for the time between the two operations.
+
+    Note that the four components are joined with no separator, and that the principal
+    has every character other than a letter, a digit, a dash or an underscore removed.
+    Therefore two different principals can give one label. The caller must check for a
+    collision; see create_assignments_manifest_from_repo_assignments.
+    """
+    pattern = r"[^a-zA-Z0-9-_]"
+    escaped_principal = re.sub(pattern, "", assignment["PrincipalId"])
+    return (
+        f"assignment_{account}{escaped_principal}"
+        f"{assignment['PrincipalType']}{assignment['PermissionSetName']}"
+    )
+
+
 def get_assignments_manifest(
     account: str,
     assignment: dict,
@@ -726,8 +774,7 @@ def get_assignments_manifest(
     """
     Helper function to create a Terraform manifest for each assignment from the provided inputs
     """
-    pattern = r"[^a-zA-Z0-9-_]"
-    escaped_principal = re.sub(pattern, "", assignment["PrincipalId"])
+    resource_name = get_assignment_resource_name(account, assignment)
     # If managed by Control Tower, just specify the ARN directly, otherwise reference our permission set
     if assignment["PermissionSetName"] in control_tower_permission_sets:
         permission_set_arn = permission_set_arn_dict[assignment["PermissionSetName"]]
@@ -737,7 +784,7 @@ def get_assignments_manifest(
             f"aws_ssoadmin_permission_set.{assignment['PermissionSetName']}.arn"
         )
     return f"""
-resource "aws_ssoadmin_account_assignment" "assignment_{account}{escaped_principal}{assignment['PrincipalType']}{assignment['PermissionSetName']}" {{
+resource "aws_ssoadmin_account_assignment" "{resource_name}" {{
   instance_arn       = local.sso_instance_arn
   permission_set_arn = {permission_set_argument}
   principal_id       = "{principal_numeric_id}"
@@ -798,7 +845,10 @@ def create_assignments_manifest_from_repo_assignments(
     Returns a string containing a Terraform manifest with all assignments represented by the template files.
     """
     log.info("Creating assignment dictionary with resolved account names")
-    output_assignments_manifest = []
+    # Keyed by Terraform resource name, so that a name used twice is detected rather
+    # than written into the manifest twice.
+    generated_resources = {}
+    collisions = []
     org_client = boto3.client(
         "organizations",
         config=boto_config,
@@ -868,19 +918,54 @@ def create_assignments_manifest_from_repo_assignments(
             # If the account is not the management account and the assignment flag is NOT management only,
             # then we will add the assignment to the resolved_assignments dictionary.
             if (eachAccount == management_account) == (mgmt_only):
-                output_assignments_manifest.append(
-                    get_assignments_manifest(
-                        account=eachAccount,
-                        assignment=assignment,
-                        principal_numeric_id=principal_numeric_id,
-                        permission_set_arn_dict=permission_set_name_dict,
-                        control_tower_permission_sets=control_tower_permission_sets,
-                    )
+                resource_name = get_assignment_resource_name(eachAccount, assignment)
+                manifest = get_assignments_manifest(
+                    account=eachAccount,
+                    assignment=assignment,
+                    principal_numeric_id=principal_numeric_id,
+                    permission_set_arn_dict=permission_set_name_dict,
+                    control_tower_permission_sets=control_tower_permission_sets,
                 )
+                source = (
+                    f"account={eachAccount} "
+                    f"principal={assignment['PrincipalId']!r} "
+                    f"type={assignment['PrincipalType']} "
+                    f"permission_set={assignment['PermissionSetName']!r}"
+                )
+                existing = generated_resources.get(resource_name)
+                if existing is None:
+                    generated_resources[resource_name] = {
+                        "manifest": manifest,
+                        "source": source,
+                    }
+                elif existing["manifest"] == manifest:
+                    # The same assignment appears in more than one input file. Keep one
+                    # copy, as the earlier set() did.
+                    pass
+                else:
+                    collisions.append((resource_name, existing["source"], source))
 
-    # Use a set to remove duplicates from the list of assignments manifests
-    output_assignments_manifest = "\n".join(list(set(output_assignments_manifest)))
-    return output_assignments_manifest
+    # Every collision is collected first, so that one run reports all of them.
+    if collisions:
+        for resource_name, first_source, second_source in collisions:
+            log.error(
+                f"Terraform resource name collision '{resource_name}':\n"
+                f"  A: {first_source}\n"
+                f"  B: {second_source}"
+            )
+        raise Exception(
+            f"{len(collisions)} assignment(s) produced a Terraform resource name that "
+            "is already in use by a different assignment. The usual cause is that "
+            "characters are removed from PrincipalId to build the name, so "
+            "'a.b@example.com' and 'ab@example.com' both become 'abexamplecom'. Rename "
+            "one of the principals, or use a different permission set for one of them. "
+            "The log above names the assignments that collided."
+        )
+
+    # Ordered by first appearance, so the generated file is the same on every run.
+    return "\n".join(
+        each_resource["manifest"] for each_resource in generated_resources.values()
+    )
 
 
 # def resolve_control_tower_permission_set_arns(permission_set_names):

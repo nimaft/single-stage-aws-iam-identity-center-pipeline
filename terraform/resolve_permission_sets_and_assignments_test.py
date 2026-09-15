@@ -101,7 +101,7 @@ EXAMPLE_PERMISSION_SET = """
     ]
   },
   "CustomerPermissionBoundary": {
-    "Path": "pbounds/",
+    "Path": "/pbounds/",
     "Name": "ViewOnlyAccessPB"
   }
 }
@@ -157,7 +157,7 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "EXAMPLEViewOnlyAccess_p
   permissions_boundary {
     customer_managed_policy_reference {
       name = "ViewOnlyAccessPB"
-      path = "pbounds/"
+      path = "/pbounds/"
     }
   }
 }
@@ -181,7 +181,7 @@ MALFORMED_PERMISSION_SET = """
     ]
   },
   "PCustomerPermissionBoundary": {
-    "Path": "pbounds/",
+    "Path": "/pbounds/",
     "Name": "PViewOnlyAccessPB"
   }
 }
@@ -601,6 +601,92 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "TestPermissionSet_permi
         self.assertEqual(result, ["111111111111"])
 
     @patch("boto3.client")
+    def test_list_accounts_in_identifier_account_name_starting_with_ou_is_not_an_ou_id(
+        self,
+        mock_boto3_client,
+    ):
+        """
+        A test for the "ou-" prefix alone sent any name that starts with "ou-" to the
+        Organizations API as an OU ID. Such a name must be resolved as a name.
+        """
+        mock_boto3_client.return_value = mock_get_client("organizations")
+        accounts_map = {
+            "ou-my-team-account": {"id": "111111111111", "tags": []},
+            "unrelated_account": {"id": "333333333333", "tags": []},
+        }
+
+        result, _ = resolve_permission_sets_and_assignments.list_accounts_in_identifier(
+            identifier="ou-my-team-account",
+            all_accounts_map=accounts_map,
+            all_ous_map={},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111"])
+
+    @patch("boto3.client")
+    def test_list_accounts_in_identifier_rejects_an_ambiguous_name(
+        self,
+        mock_boto3_client,
+    ):
+        """
+        An AWS account name can hold any printable character, so an account or an OU can
+        be named "ROOT", or named to look like a root ID or an OU ID. Reading such a
+        name as an ID grants access to every account in the organization, so the
+        resolver must refuse to guess.
+        """
+        mock_boto3_client.return_value = mock_get_client("organizations")
+        for identifier, accounts_map, ous_map in [
+            ("ROOT", {"ROOT": {"id": "111111111111", "tags": []}}, {}),
+            ("Root", {"Root": {"id": "111111111111", "tags": []}}, {}),
+            ("r-abcd", {"r-abcd": {"id": "111111111111", "tags": []}}, {}),
+            ("ROOT", {}, {"ROOT": [{"Id": "ou-1234-12345678"}]}),
+            (
+                "ou-abcd-12345678",
+                {"ou-abcd-12345678": {"id": "111111111111", "tags": []}},
+                {},
+            ),
+        ]:
+            with self.assertRaises(Exception) as context:
+                resolve_permission_sets_and_assignments.list_accounts_in_identifier(
+                    identifier=identifier,
+                    all_accounts_map=accounts_map,
+                    all_ous_map=ous_map,
+                    boto_config=self.mock_boto_config,
+                    identifier_cache={},
+                )
+            self.assertIn(identifier, str(context.exception))
+            self.assertIn("target it by its ID", str(context.exception))
+
+    @patch("resolve_permission_sets_and_assignments.list_accounts_in_identifier")
+    def test_resolve_targets_rejects_an_account_named_like_an_account_id(
+        self,
+        mock_list_accounts_in_identifier,
+    ):
+        """
+        An account can be named with 12 digits. Such a target can be the name of one
+        account and the ID of another.
+        """
+        assignment = {
+            "Target": ["111111111111"],
+            "PrincipalId": "SomeGroup",
+            "PermissionSetName": "SomePermissionSet",
+        }
+
+        with self.assertRaises(Exception) as context:
+            resolve_permission_sets_and_assignments.resolve_targets(
+                each_current_assignments=assignment,
+                all_accounts_map={"111111111111": {"id": "222222222222", "tags": []}},
+                all_ous_map={},
+                boto_config=self.mock_boto_config,
+                identifier_cache={},
+            )
+
+        # The message names the ID of the account that carries the confusing name
+        self.assertIn("222222222222", str(context.exception))
+
+    @patch("boto3.client")
     def test_list_accounts_in_identifier_literal_root_still_matches(
         self,
         mock_boto3_client,
@@ -931,10 +1017,40 @@ class TestIdentifiers(unittest.TestCase):
             self.assertFalse(identifiers.is_aws_account_id(value), value)
 
     def test_is_organization_root_id(self):
-        for value in ["r-1234", "r-abcd1234"]:
+        """
+        The AWS Organizations pattern for a root ID is "r-" followed by 4 to 32
+        lowercase letters or digits.
+        """
+        for value in ["r-1234", "r-abcd1234", "r-" + "a" * 32]:
             self.assertTrue(identifiers.is_organization_root_id(value), value)
-        for value in ["prod-r-us", "ROOT", "r-", "ou-1234-12345678"]:
+        for value in [
+            "prod-r-us",  # a name that contains "r-"
+            "ROOT",
+            "r-",  # no suffix
+            "r-abc",  # fewer than 4 characters
+            "r-ABCD",  # uppercase
+            "r-" + "a" * 33,  # more than 32 characters
+            "ou-1234-12345678",
+        ]:
             self.assertFalse(identifiers.is_organization_root_id(value), value)
+
+    def test_is_organizational_unit_id(self):
+        """
+        The AWS Organizations pattern for an OU ID is "ou-" followed by 4 to 32
+        lowercase letters or digits, then a dash, then 8 to 32 more.
+        """
+        for value in ["ou-1234-12345678", "ou-abcd1234-abcdefgh1234"]:
+            self.assertTrue(identifiers.is_organizational_unit_id(value), value)
+        for value in [
+            "ou-12345678",  # no root part
+            "ou-1234-1234567",  # second part shorter than 8 characters
+            "ou-abc-12345678",  # first part shorter than 4 characters
+            "ou-1234-ABCDEFGH",  # uppercase
+            "ou-1234-12345678-extra",
+            "ou-my-team-account",  # a name that starts with "ou-"
+            "r-1234",
+        ]:
+            self.assertFalse(identifiers.is_organizational_unit_id(value), value)
 
     def test_is_valid_terraform_identifier(self):
         for value in ["MyPermissionSet", "_leading_underscore", "a-b_c1"]:
@@ -965,6 +1081,217 @@ class TestIdentifiers(unittest.TestCase):
             ),
             ("policy/sso/", "myPolicy"),
         )
+
+
+class TestAssignmentManifestGeneration(unittest.TestCase):
+    """
+    Tests for the generated assignment resources, and for the check that two
+    assignments do not produce one Terraform resource name.
+    """
+
+    mock_boto_config = Config(retries={"max_attempts": 0})
+    control_tower_permission_sets = ["AWSReadOnlyAccess"]
+
+    def test_get_assignment_resource_name_does_not_change(self):
+        """
+        This is the guard for the decision to keep the existing resource names. The
+        name is the Terraform address of a live resource. A change here makes Terraform
+        destroy and create every assignment, which removes access while it does so.
+        """
+        self.assertEqual(
+            resolve_permission_sets_and_assignments.get_assignment_resource_name(
+                "111111111111",
+                {
+                    "PrincipalId": "a.b@example.com",
+                    "PrincipalType": "USER",
+                    "PermissionSetName": "ViewOnlyAccess",
+                },
+            ),
+            "assignment_111111111111abexamplecomUSERViewOnlyAccess",
+        )
+        self.assertEqual(
+            resolve_permission_sets_and_assignments.get_assignment_resource_name(
+                "222222222222",
+                {
+                    "PrincipalId": "AWS-Security-Auditors",
+                    "PrincipalType": "GROUP",
+                    "PermissionSetName": "SecurityAudit",
+                },
+            ),
+            "assignment_222222222222AWS-Security-AuditorsGROUPSecurityAudit",
+        )
+
+    def test_get_assignments_manifest_references_the_permission_set_resource(self):
+        output = resolve_permission_sets_and_assignments.get_assignments_manifest(
+            account="111111111111",
+            assignment={
+                "PrincipalId": "SomeGroup",
+                "PrincipalType": "GROUP",
+                "PermissionSetName": "ViewOnlyAccess",
+            },
+            principal_numeric_id="group-1",
+            permission_set_arn_dict={},
+            control_tower_permission_sets=self.control_tower_permission_sets,
+        )
+        self.assertIn(
+            'resource "aws_ssoadmin_account_assignment" '
+            '"assignment_111111111111SomeGroupGROUPViewOnlyAccess"',
+            output,
+        )
+        self.assertIn(
+            "permission_set_arn = aws_ssoadmin_permission_set.ViewOnlyAccess.arn",
+            output,
+        )
+
+    def test_get_assignments_manifest_uses_a_literal_arn_for_control_tower(self):
+        output = resolve_permission_sets_and_assignments.get_assignments_manifest(
+            account="111111111111",
+            assignment={
+                "PrincipalId": "SomeGroup",
+                "PrincipalType": "GROUP",
+                "PermissionSetName": "AWSReadOnlyAccess",
+            },
+            principal_numeric_id="group-1",
+            permission_set_arn_dict={"AWSReadOnlyAccess": "arn:aws:sso:::ps/example"},
+            control_tower_permission_sets=self.control_tower_permission_sets,
+        )
+        self.assertIn('permission_set_arn = "arn:aws:sso:::ps/example"', output)
+
+    def build_manifest(self, assignments, accounts_by_principal, mgmt_only=False):
+        """
+        Calls create_assignments_manifest_from_repo_assignments with the Organizations
+        and Identity Store calls mocked out.
+        """
+        mock_org = MagicMock()
+        mock_org.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "999999999999"}
+        }
+        mock_org.list_accounts.return_value = {"Accounts": []}
+        mock_org.list_roots.return_value = {"Roots": [{"Id": "r-1234"}]}
+
+        def fake_resolve_targets(each_current_assignments, **kwargs):
+            return accounts_by_principal[each_current_assignments["PrincipalId"]], {}
+
+        def fake_lookup_principal_id(principal_name, principal_type, **kwargs):
+            return f"id-of-{principal_name}", {}
+
+        with patch("boto3.client", return_value=mock_org), patch(
+            "resolve_permission_sets_and_assignments.get_all_ous_map", return_value={}
+        ), patch(
+            "resolve_permission_sets_and_assignments.resolve_targets",
+            side_effect=fake_resolve_targets,
+        ), patch(
+            "resolve_permission_sets_and_assignments.lookup_principal_id",
+            side_effect=fake_lookup_principal_id,
+        ):
+            return resolve_permission_sets_and_assignments.create_assignments_manifest_from_repo_assignments(
+                repository_assignments={"Assignments": assignments},
+                identity_store="d-1234567890",
+                permission_set_name_dict={},
+                mgmt_only=mgmt_only,
+                control_tower_permission_sets=self.control_tower_permission_sets,
+                boto_config=self.mock_boto_config,
+            )
+
+    def test_identical_assignments_are_deduplicated(self):
+        """
+        The same assignment can appear in more than one input file. One copy must reach
+        the manifest, as the earlier set() gave.
+        """
+        assignment = {
+            "PrincipalId": "SomeGroup",
+            "PrincipalType": "GROUP",
+            "PermissionSetName": "ViewOnlyAccess",
+            "Target": ["111111111111"],
+        }
+
+        output = self.build_manifest(
+            assignments=[assignment, dict(assignment)],
+            accounts_by_principal={"SomeGroup": ["111111111111"]},
+        )
+
+        self.assertEqual(output.count("aws_ssoadmin_account_assignment"), 1)
+
+    def test_a_resource_name_collision_raises(self):
+        """
+        Every character other than a letter, a digit, a dash or an underscore is
+        removed from PrincipalId to build the resource name. Therefore two principals
+        can give one name, and the generated manifest would hold the same resource
+        name twice and would not parse.
+        """
+        assignments = [
+            {
+                "PrincipalId": "a.b@example.com",
+                "PrincipalType": "USER",
+                "PermissionSetName": "ViewOnlyAccess",
+                "Target": ["111111111111"],
+            },
+            {
+                "PrincipalId": "ab@example.com",
+                "PrincipalType": "USER",
+                "PermissionSetName": "ViewOnlyAccess",
+                "Target": ["111111111111"],
+            },
+        ]
+
+        with self.assertRaises(Exception) as context:
+            self.build_manifest(
+                assignments=assignments,
+                accounts_by_principal={
+                    "a.b@example.com": ["111111111111"],
+                    "ab@example.com": ["111111111111"],
+                },
+            )
+
+        self.assertIn("resource name", str(context.exception))
+
+    def test_the_output_is_the_same_on_every_run(self):
+        """
+        The earlier code joined a set, so the order of the generated file changed
+        between runs. A stable order makes the file easier to read while debugging.
+        """
+        assignments = [
+            {
+                "PrincipalId": f"Group{index}",
+                "PrincipalType": "GROUP",
+                "PermissionSetName": "ViewOnlyAccess",
+                "Target": ["111111111111"],
+            }
+            for index in range(10)
+        ]
+        accounts_by_principal = {f"Group{index}": ["111111111111"] for index in range(10)}
+
+        first = self.build_manifest(assignments, accounts_by_principal)
+        second = self.build_manifest(assignments, accounts_by_principal)
+
+        self.assertEqual(first, second)
+
+    def test_management_account_assignments_are_separated(self):
+        """
+        A member account assignment must not be generated in management-only mode, and
+        the reverse. This is the delegated administrator boundary.
+        """
+        assignments = [
+            {
+                "PrincipalId": "SomeGroup",
+                "PrincipalType": "GROUP",
+                "PermissionSetName": "ViewOnlyAccess",
+                "Target": ["111111111111", "999999999999"],
+            }
+        ]
+        accounts_by_principal = {"SomeGroup": ["111111111111", "999999999999"]}
+
+        member_output = self.build_manifest(
+            assignments, accounts_by_principal, mgmt_only=False
+        )
+        management_output = self.build_manifest(
+            assignments, accounts_by_principal, mgmt_only=True
+        )
+
+        self.assertIn('target_id          = "111111111111"', member_output)
+        self.assertNotIn('target_id          = "999999999999"', member_output)
+        self.assertIn('target_id          = "999999999999"', management_output)
+        self.assertNotIn('target_id          = "111111111111"', management_output)
 
 
 class TestManifestAndAssignmentContent(fake_filesystem_unittest.TestCase):

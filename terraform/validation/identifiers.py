@@ -35,7 +35,14 @@ ACCOUNT_ID_REGEX = re.compile(r"\d{12}")
 
 # An AWS Organizations root ID always starts with "r-". Anchor the match: a substring
 # test would treat any name containing "r-" as the organization root.
+# Pattern from the AWS Organizations API reference: "r-" followed by 4 to 32 lowercase
+# letters or digits.
 ROOT_ID_REGEX = re.compile(r"r-[0-9a-z]{4,32}")
+
+# Pattern from the AWS Organizations API reference: "ou-" followed by 4 to 32 lowercase
+# letters or digits (the ID of the root that holds the OU), then a dash, then 8 to 32
+# more lowercase letters or digits.
+ORGANIZATIONAL_UNIT_ID_REGEX = re.compile(r"ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}")
 
 # Terraform identifiers (used for resource names) must start with a letter or an
 # underscore and may then contain letters, digits, underscores and dashes.
@@ -57,6 +64,16 @@ def is_organization_root_id(value) -> bool:
     Returns True only if the string form of the value is an AWS Organizations root ID.
     """
     return bool(ROOT_ID_REGEX.fullmatch(str(value)))
+
+
+def is_organizational_unit_id(value) -> bool:
+    """
+    Returns True only if the string form of the value is an AWS Organizations OU ID.
+
+    A value that starts with "ou-" but does not match the complete pattern is not an
+    OU ID. The caller must then use it as an account name or an OU name.
+    """
+    return bool(ORGANIZATIONAL_UNIT_ID_REGEX.fullmatch(str(value)))
 
 
 def is_valid_terraform_identifier(value) -> bool:
