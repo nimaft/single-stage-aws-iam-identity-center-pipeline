@@ -21,6 +21,7 @@ from pyfakefs import fake_filesystem_unittest
 from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 import resolve_permission_sets_and_assignments
+from validation import identifiers
 from botocore.config import Config
 
 #############
@@ -544,6 +545,425 @@ resource "aws_ssoadmin_permissions_boundary_attachment" "TestPermissionSet_permi
         self.assertEqual(test_response_ou, ["111111111111"])
         self.assertEqual(
             test_response_root, ["111111111111", "333333333333", "444444444444"]
+        )
+
+    @patch("resolve_permission_sets_and_assignments.get_all_accounts_in_ou")
+    @patch("boto3.client")
+    def test_list_accounts_in_identifier_ou_name_containing_r_dash_is_not_root(
+        self,
+        mock_boto3_client,
+        mock_get_all_accounts_in_ou,
+    ):
+        """
+        An OU or account name that merely contains "r-" must not be treated as the
+        organization root. A substring test for "r-" expanded such a name to every
+        account in the organization.
+        """
+        mock_boto3_client.return_value = mock_get_client("organizations")
+        accounts_map = {
+            "account_in_prod_r_us": {"id": "111111111111", "tags": []},
+            "unrelated_account": {"id": "333333333333", "tags": []},
+            "unrelated_account_2": {"id": "444444444444", "tags": []},
+        }
+        mock_get_all_accounts_in_ou.return_value = [
+            {"Id": "111111111111", "State": "ACTIVE"},
+        ]
+
+        result, _ = resolve_permission_sets_and_assignments.list_accounts_in_identifier(
+            identifier="prod-r-us",
+            all_accounts_map=accounts_map,
+            all_ous_map={"prod-r-us": [{"Id": "ou-1234-12345678"}]},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111"])
+
+    @patch("boto3.client")
+    def test_list_accounts_in_identifier_account_name_containing_r_dash_is_not_root(
+        self,
+        mock_boto3_client,
+    ):
+        mock_boto3_client.return_value = mock_get_client("organizations")
+        accounts_map = {
+            "prod-r-us": {"id": "111111111111", "tags": []},
+            "unrelated_account": {"id": "333333333333", "tags": []},
+        }
+
+        result, _ = resolve_permission_sets_and_assignments.list_accounts_in_identifier(
+            identifier="prod-r-us",
+            all_accounts_map=accounts_map,
+            all_ous_map={},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111"])
+
+    @patch("boto3.client")
+    def test_list_accounts_in_identifier_literal_root_still_matches(
+        self,
+        mock_boto3_client,
+    ):
+        """Guards against over-tightening the root match."""
+        mock_boto3_client.return_value = mock_get_client("organizations")
+        accounts_map = {
+            "account_one": {"id": "111111111111", "tags": []},
+            "account_two": {"id": "333333333333", "tags": []},
+        }
+
+        for identifier in ["ROOT", "Root", "r-1234"]:
+            result, _ = (
+                resolve_permission_sets_and_assignments.list_accounts_in_identifier(
+                    identifier=identifier,
+                    all_accounts_map=accounts_map,
+                    all_ous_map={},
+                    boto_config=self.mock_boto_config,
+                    identifier_cache={},
+                )
+            )
+            self.assertEqual(
+                result,
+                ["111111111111", "333333333333"],
+                f"identifier {identifier} should resolve to all accounts",
+            )
+
+    @patch("resolve_permission_sets_and_assignments.resolve_ou_names")
+    def test_get_all_accounts_in_ou_paginates_against_each_ou(
+        self,
+        mock_resolve_ou_names,
+    ):
+        """
+        Each OU must be paginated against its own ID. An earlier version passed the
+        original ou_id for every page after the first, so accounts from a different
+        OU were returned.
+        """
+        mock_resolve_ou_names.return_value = [
+            {"Id": "ou-1234-aaaaaaaa"},
+            {"Id": "ou-1234-bbbbbbbb"},
+        ]
+        pages_by_parent = {
+            # Two pages, to exercise pagination
+            "ou-1234-aaaaaaaa": [
+                {"Accounts": [{"Id": "111111111111", "State": "ACTIVE"}]},
+                {"Accounts": [{"Id": "222222222222", "State": "ACTIVE"}]},
+            ],
+            "ou-1234-bbbbbbbb": [
+                {"Accounts": [{"Id": "333333333333", "State": "ACTIVE"}]},
+            ],
+        }
+        mock_client = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.side_effect = lambda ParentId: pages_by_parent[ParentId]
+        mock_client.get_paginator.return_value = mock_paginator
+
+        result = resolve_permission_sets_and_assignments.get_all_accounts_in_ou(
+            ou_id="ou-1234-aaaaaaaa",
+            client=mock_client,
+        )
+
+        self.assertEqual(
+            [each_account["Id"] for each_account in result],
+            ["111111111111", "222222222222", "333333333333"],
+        )
+        self.assertEqual(
+            [call.kwargs["ParentId"] for call in mock_paginator.paginate.call_args_list],
+            ["ou-1234-aaaaaaaa", "ou-1234-bbbbbbbb"],
+        )
+
+    @patch("resolve_permission_sets_and_assignments.resolve_ou_names")
+    def test_get_all_accounts_in_ou_skips_inactive_accounts(
+        self,
+        mock_resolve_ou_names,
+    ):
+        mock_resolve_ou_names.return_value = [{"Id": "ou-1234-aaaaaaaa"}]
+        mock_client = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Accounts": [
+                    {"Id": "111111111111", "State": "ACTIVE"},
+                    {"Id": "222222222222", "State": "SUSPENDED"},
+                ]
+            },
+            {"Accounts": [{"Id": "333333333333", "State": "SUSPENDED"}]},
+        ]
+        mock_client.get_paginator.return_value = mock_paginator
+
+        result = resolve_permission_sets_and_assignments.get_all_accounts_in_ou(
+            ou_id="ou-1234-aaaaaaaa",
+            client=mock_client,
+        )
+
+        self.assertEqual([each_account["Id"] for each_account in result], ["111111111111"])
+
+    @patch("resolve_permission_sets_and_assignments.list_accounts_in_identifier")
+    def test_resolve_targets_account_id_is_used_without_a_lookup(
+        self,
+        mock_list_accounts_in_identifier,
+    ):
+        assignment = {
+            "Target": ["111111111111"],
+            "PrincipalId": "SomeGroup",
+            "PermissionSetName": "SomePermissionSet",
+        }
+
+        result, _ = resolve_permission_sets_and_assignments.resolve_targets(
+            each_current_assignments=assignment,
+            all_accounts_map={},
+            all_ous_map={},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111"])
+        mock_list_accounts_in_identifier.assert_not_called()
+
+    @patch("resolve_permission_sets_and_assignments.list_accounts_in_identifier")
+    def test_resolve_targets_digit_strings_that_are_not_account_ids_are_looked_up(
+        self,
+        mock_list_accounts_in_identifier,
+    ):
+        """
+        The account ID test must match the whole string. An unanchored match treated a
+        13 digit string, and a name beginning with 12 digits, as account IDs and used
+        them with no lookup at all.
+        """
+        mock_list_accounts_in_identifier.return_value = (["999999999999"], {})
+        for target in ["1234567890123", "111111111111-sandbox", "11111111111"]:
+            mock_list_accounts_in_identifier.reset_mock()
+            assignment = {
+                "Target": [target],
+                "PrincipalId": "SomeGroup",
+                "PermissionSetName": "SomePermissionSet",
+            }
+
+            result, _ = resolve_permission_sets_and_assignments.resolve_targets(
+                each_current_assignments=assignment,
+                all_accounts_map={},
+                all_ous_map={},
+                boto_config=self.mock_boto_config,
+                identifier_cache={},
+            )
+
+            self.assertEqual(result, ["999999999999"])
+            self.assertEqual(
+                mock_list_accounts_in_identifier.call_args.kwargs["identifier"],
+                target,
+            )
+
+    @patch("resolve_permission_sets_and_assignments.list_accounts_in_identifier")
+    def test_resolve_targets_exclusions(
+        self,
+        mock_list_accounts_in_identifier,
+    ):
+        mock_list_accounts_in_identifier.return_value = (
+            ["111111111111", "222222222222", "333333333333"],
+            {},
+        )
+        assignment = {
+            "Target": ["SomeOU"],
+            "Exclusions": ["222222222222"],
+            "PrincipalId": "SomeGroup",
+            "PermissionSetName": "SomePermissionSet",
+        }
+
+        result, _ = resolve_permission_sets_and_assignments.resolve_targets(
+            each_current_assignments=assignment,
+            all_accounts_map={},
+            all_ous_map={},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111", "333333333333"])
+
+    @patch("resolve_permission_sets_and_assignments.list_accounts_in_identifier")
+    def test_resolve_targets_exclusion_that_is_not_present_is_a_noop(
+        self,
+        mock_list_accounts_in_identifier,
+    ):
+        mock_list_accounts_in_identifier.return_value = (["111111111111"], {})
+        assignment = {
+            "Target": ["SomeOU"],
+            "Exclusions": ["999999999999"],
+            "PrincipalId": "SomeGroup",
+            "PermissionSetName": "SomePermissionSet",
+        }
+
+        result, _ = resolve_permission_sets_and_assignments.resolve_targets(
+            each_current_assignments=assignment,
+            all_accounts_map={},
+            all_ous_map={},
+            boto_config=self.mock_boto_config,
+            identifier_cache={},
+        )
+
+        self.assertEqual(result, ["111111111111"])
+
+    @patch("boto3.client")
+    def test_lookup_principal_id_group_and_user(self, mock_boto3_client):
+        mock_id_store = mock_get_client("identitystore")
+        mock_id_store.reset_mock()
+        mock_boto3_client.return_value = mock_id_store
+        mock_id_store.list_groups.return_value = {"Groups": [{"GroupId": "group-1"}]}
+        mock_id_store.list_users.return_value = {"Users": [{"UserId": "user-1"}]}
+
+        group_id, cache = resolve_permission_sets_and_assignments.lookup_principal_id(
+            "SomeGroup",
+            "GROUP",
+            identity_store_id="d-1234567890",
+            boto_config=self.mock_boto_config,
+            principal_cache={},
+        )
+        user_id, cache = resolve_permission_sets_and_assignments.lookup_principal_id(
+            "SomeUser",
+            "USER",
+            identity_store_id="d-1234567890",
+            boto_config=self.mock_boto_config,
+            principal_cache=cache,
+        )
+
+        self.assertEqual(group_id, "group-1")
+        self.assertEqual(user_id, "user-1")
+        self.assertEqual(cache, {"GROUP|SomeGroup": "group-1", "USER|SomeUser": "user-1"})
+
+        # A second lookup of a cached principal must not call the API again
+        mock_id_store.list_groups.reset_mock()
+        cached_id, _ = resolve_permission_sets_and_assignments.lookup_principal_id(
+            "SomeGroup",
+            "GROUP",
+            identity_store_id="d-1234567890",
+            boto_config=self.mock_boto_config,
+            principal_cache=cache,
+        )
+        self.assertEqual(cached_id, "group-1")
+        mock_id_store.list_groups.assert_not_called()
+
+    @patch("boto3.client")
+    def test_lookup_principal_id_raises_when_no_match(self, mock_boto3_client):
+        """
+        A failed lookup previously fell off the end of the function and returned None,
+        which the caller unpacked into two names, producing an unrelated TypeError
+        traceback that hid the real cause.
+        """
+        mock_id_store = mock_get_client("identitystore")
+        mock_id_store.reset_mock()
+        mock_boto3_client.return_value = mock_id_store
+        mock_id_store.list_groups.return_value = {"Groups": []}
+
+        with self.assertRaises(Exception) as context:
+            resolve_permission_sets_and_assignments.lookup_principal_id(
+                "TypoedGroupName",
+                "GROUP",
+                identity_store_id="d-1234567890",
+                boto_config=self.mock_boto_config,
+                principal_cache={},
+            )
+
+        self.assertIn("TypoedGroupName", str(context.exception))
+        self.assertIn("GROUP", str(context.exception))
+
+    @patch("boto3.client")
+    def test_lookup_principal_id_raises_on_duplicate_matches(self, mock_boto3_client):
+        mock_id_store = mock_get_client("identitystore")
+        mock_id_store.reset_mock()
+        mock_boto3_client.return_value = mock_id_store
+        mock_id_store.list_users.return_value = {
+            "Users": [{"UserId": "user-1"}, {"UserId": "user-2"}]
+        }
+
+        with self.assertRaises(Exception) as context:
+            resolve_permission_sets_and_assignments.lookup_principal_id(
+                "AmbiguousUser",
+                "USER",
+                identity_store_id="d-1234567890",
+                boto_config=self.mock_boto_config,
+                principal_cache={},
+            )
+
+        self.assertIn("AmbiguousUser", str(context.exception))
+
+    @patch("boto3.client")
+    def test_lookup_principal_id_raises_on_unsupported_principal_type(
+        self, mock_boto3_client
+    ):
+        """An unrecognised PrincipalType previously returned None with no log at all."""
+        mock_boto3_client.return_value = mock_get_client("identitystore")
+
+        with self.assertRaises(Exception) as context:
+            resolve_permission_sets_and_assignments.lookup_principal_id(
+                "SomeGroup",
+                "group",  # lowercase: not a valid PrincipalType
+                identity_store_id="d-1234567890",
+                boto_config=self.mock_boto_config,
+                principal_cache={},
+            )
+
+        self.assertIn("group", str(context.exception))
+        self.assertIn("PrincipalType", str(context.exception))
+
+    def test_mgmt_only_flag_parsing(self):
+        """
+        --mgmt-only used type=bool, so any value (including "False") evaluated to True,
+        and the default of False meant the MGMT_ONLY environment variable fallback was
+        unreachable.
+        """
+        parser = resolve_permission_sets_and_assignments.build_arg_parser()
+        self.assertIsNone(parser.parse_args([]).mgmt_only)
+        self.assertTrue(parser.parse_args(["--mgmt-only"]).mgmt_only)
+        self.assertFalse(parser.parse_args(["--no-mgmt-only"]).mgmt_only)
+
+
+class TestIdentifiers(unittest.TestCase):
+    """Tests for the shared identifier helpers in validation/identifiers.py."""
+
+    def test_is_aws_account_id(self):
+        for value in ["111111111111", "000000000001", 111111111111]:
+            self.assertTrue(identifiers.is_aws_account_id(value), value)
+        for value in [
+            "1234567890123",  # too long: an unanchored match accepted this
+            "11111111111",  # too short
+            "111111111111-sandbox",  # name that starts with 12 digits
+            "sandbox",
+            "",
+        ]:
+            self.assertFalse(identifiers.is_aws_account_id(value), value)
+
+    def test_is_organization_root_id(self):
+        for value in ["r-1234", "r-abcd1234"]:
+            self.assertTrue(identifiers.is_organization_root_id(value), value)
+        for value in ["prod-r-us", "ROOT", "r-", "ou-1234-12345678"]:
+            self.assertFalse(identifiers.is_organization_root_id(value), value)
+
+    def test_is_valid_terraform_identifier(self):
+        for value in ["MyPermissionSet", "_leading_underscore", "a-b_c1"]:
+            self.assertTrue(identifiers.is_valid_terraform_identifier(value), value)
+        for value in ["1LeadingDigit", "-leading-dash", "has space", "has.dot", ""]:
+            self.assertFalse(identifiers.is_valid_terraform_identifier(value), value)
+
+    def test_parse_customer_managed_policy_reference(self):
+        self.assertEqual(
+            identifiers.parse_customer_managed_policy_reference("myPolicy"),
+            ("/", "myPolicy"),
+        )
+        self.assertEqual(
+            identifiers.parse_customer_managed_policy_reference("/sso/global/myPolicy"),
+            ("/sso/global/", "myPolicy"),
+        )
+        # The path is returned as written, not normalised. Validation rejects a path
+        # with no leading slash.
+        self.assertEqual(
+            identifiers.parse_customer_managed_policy_reference("sso/global/myPolicy"),
+            ("sso/global/", "myPolicy"),
+        )
+        # An ARN is not a supported value: the template holds a policy name. It parses
+        # to a path with no leading slash, which validation rejects.
+        self.assertEqual(
+            identifiers.parse_customer_managed_policy_reference(
+                "arn:aws:iam::111111111111:policy/sso/myPolicy"
+            ),
+            ("policy/sso/", "myPolicy"),
         )
 
 

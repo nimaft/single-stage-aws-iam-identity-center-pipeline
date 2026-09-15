@@ -71,6 +71,11 @@ import re
 import yaml
 import argparse
 import validation.iam_identitycenter_validation as iam_identitycenter_validation
+from validation.identifiers import (
+    is_aws_account_id,
+    is_organization_root_id,
+    parse_customer_managed_policy_reference,
+)
 import sys
 
 # Logging configuration
@@ -145,13 +150,7 @@ def get_permission_set_customer_managed_policies(data: dict):
 
     attachment_strings = []
     for policy_name in data["CustomerManagedPolicies"]:
-        pieces = policy_name.split(":")[-1].split("/")
-        if len(pieces) == 1:
-            path = "/"
-            policy_base_name = pieces[0]
-        else:
-            path = "/".join(pieces[:-1]) + "/"
-            policy_base_name = pieces[-1]
+        path, policy_base_name = parse_customer_managed_policy_reference(policy_name)
         attachment_strings.append(
             f"""
 resource "aws_ssoadmin_customer_managed_policy_attachment" "{data["Name"]}_customer_managed_policy_{policy_base_name}" {{
@@ -384,16 +383,13 @@ def get_all_accounts_in_ou(
     """
     all_accounts = []
     all_ous = resolve_ou_names(ou_id, client)
+    paginator = client.get_paginator("list_accounts_for_parent")
     for each_ou in all_ous:
-        response = client.list_accounts_for_parent(ParentId=each_ou["Id"])
-        for each_account in response["Accounts"]:
-            if each_account["State"] == "ACTIVE":
-                all_accounts.append(each_account)
-        while "NextToken" in response:
-            response = client.list_accounts_for_parent(
-                ParentId=ou_id, NextToken=response["NextToken"]
-            )
-            for each_account in response["Accounts"]:
+        # Use the paginator rather than a hand-rolled NextToken loop: an earlier
+        # version paginated against the wrong ParentId, so every page after the first
+        # returned accounts from a different OU.
+        for page in paginator.paginate(ParentId=each_ou["Id"]):
+            for each_account in page["Accounts"]:
                 if each_account["State"] == "ACTIVE":
                     all_accounts.append(each_account)
 
@@ -498,7 +494,10 @@ def list_accounts_in_identifier(
             )
         results.extend(accounts_matching_tag_target)
     # Case for Root
-    elif "r-" in identifier or "ROOT" == identifier.upper():
+    # NOTE: match the root ID exactly. A substring test for "r-" would treat any
+    # account or OU name containing "r-" (eg. "prod-r-us") as the organization root
+    # and silently expand it to every account in the organization.
+    elif is_organization_root_id(identifier) or "ROOT" == identifier.upper():
         for each_account in all_accounts_map.values():
             results.append(
                 {
@@ -561,10 +560,21 @@ def lookup_principal_id(
 ) -> str:
     """
     Given an identity store and principal Name and Type, looks up the user ID in the given Identity Store
-    Returns: string with principal ID
+    Returns: a tuple of (principal ID, updated principal cache)
+
+    Raises if the principal cannot be resolved to exactly one ID. Do not soften this
+    into a sentinel return value: an empty principal ID would be written into the
+    generated Terraform, which is a silent authorization defect.
     """
     if f"{principalType}|{principalName}" in principal_cache:
         return principal_cache[f"{principalType}|{principalName}"], principal_cache
+    # Checked before the lookup so that the message is not swallowed by the except
+    # block below. Previously an unrecognised type returned None with no log at all.
+    if principalType not in ("USER", "GROUP"):
+        raise Exception(
+            f"[PR: {principalName}] Unsupported PrincipalType '{principalType}'. "
+            "PrincipalType must be exactly 'USER' or 'GROUP'."
+        )
     try:
         client = boto3.client(
             "identitystore",
@@ -605,6 +615,11 @@ def lookup_principal_id(
             f"[PR: {principalName}] [{principalType}]  It was not possible to lookup target. Reason: "
             + repr(error)
         )
+        raise Exception(
+            f"Unable to resolve principal '{principalName}' of type '{principalType}' "
+            f"in identity store {identity_store_id}. Check that the name exactly "
+            f"matches a single user or group in Identity Center. Reason: {error}"
+        ) from error
 
 
 def create_permission_set_arn_dict(
@@ -644,8 +659,8 @@ def resolve_targets(
     """
     Given an assignment object, loop through its targets and flatten any OU/root references to the child accounts of that OU/root.
 
-    Only the direct child accounts of an OU will be included in the resolved list; sub-OUs' accounts will not be included.
-    If root is specified, however, all accounts in the Organization (except the management account) will be included.
+    An OU target is resolved recursively: every account below the OU is included, at any depth.
+    If root is specified, all accounts in the Organization (except the management account) will be included.
     """
     account_list = []
     updated_identifier_cache = identifier_cache
@@ -653,11 +668,11 @@ def resolve_targets(
     log.info(f"[Identifier: {identifier_string}] Resolving target in accounts")
     for eachTarget in each_current_assignments["Target"]:
         # Accounts by ID
-        string_target = str(
-            eachTarget
-        )  # TODO - ensure that leading zeros are handled correctly
-        pattern = re.compile(r"\d{12}")  # Regex for AWS Account Id
-        if pattern.match(string_target):
+        # NOTE: an unquoted account ID in YAML is parsed as an int, which loses any
+        # leading zero. Validation rejects that, so anything reaching here is either a
+        # quoted 12 digit string or a name.
+        string_target = str(eachTarget)
+        if is_aws_account_id(string_target):
             account_list.append(string_target)
         # Account names, OUs, and ROOT
         else:
@@ -672,8 +687,7 @@ def resolve_targets(
     # Allow for an Exclusions key to remove
     for eachExclusion in each_current_assignments.get("Exclusions", []):
         string_exclusion = str(eachExclusion)
-        pattern = re.compile(r"\d{12}")  # Regex for AWS Account Id
-        if pattern.match(string_exclusion):
+        if is_aws_account_id(string_exclusion):
             try:
                 account_list.remove(string_exclusion)
             except ValueError:
@@ -874,15 +888,11 @@ def create_assignments_manifest_from_repo_assignments(
 #     return_value = {}
 
 
-def main():
-    # Environment variable that determines whether to generate management or member assignments
-    try:
-        mgmt_only_env = os.environ.get("MGMT_ONLY").lower() in ["true", "1"]
-    except AttributeError:
-        logging.warning("Environment variable MGMT_ONLY not set, assuming False")
-        mgmt_only_env = False
-
-    # Setting arguments
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Builds the command line argument parser. Kept separate from main() so that the
+    argument handling can be unit tested without running the script.
+    """
     parser = argparse.ArgumentParser(description="AWS SSO Permission Set Management")
     parser.add_argument(
         "--templates-relative-path",
@@ -898,10 +908,14 @@ def main():
     )
     parser.add_argument(
         "--mgmt-only",
-        action="store",
-        type=bool,
+        # BooleanOptionalAction gives --mgmt-only and --no-mgmt-only. Do not use
+        # type=bool: that runs the bool() constructor over the string, so
+        # "--mgmt-only False" would evaluate to True.
+        action=argparse.BooleanOptionalAction,
         help="Flag to indicate whether to generate management or member assignments. This will override the environment variable MGMT_ONLY, if specified",
-        default=False,
+        # Defaults to None so that main() can tell "not specified" apart from
+        # "explicitly false" and fall back to the MGMT_ONLY environment variable.
+        default=None,
     )
     parser.add_argument(
         "--region",
@@ -914,7 +928,15 @@ def main():
         default=["ERROR"],
         help="The types of policy findings that should cause the script to fail.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    # Environment variable that determines whether to generate management or member
+    # assignments. Only used when --mgmt-only/--no-mgmt-only is not passed.
+    mgmt_only_env = os.environ.get("MGMT_ONLY", "").lower() in ["true", "1"]
+
+    args = build_arg_parser().parse_args()
     templates_relative_path = args.templates_relative_path
     permission_sets_template_relative_path = args.permission_sets_template_relative_path
     mgmt_only = args.mgmt_only
@@ -926,6 +948,10 @@ def main():
         boto_config = Config()
 
     if mgmt_only is None:
+        logging.warning(
+            "Neither --mgmt-only nor --no-mgmt-only was specified, falling back to the "
+            f"MGMT_ONLY environment variable (resolved to {mgmt_only_env})"
+        )
         mgmt_only = mgmt_only_env
     PERMISSION_SET_MANIFEST_OUTPUT_FILE_PATH = "./permission_sets_auto.tf"
     ASSIGNMENTS_MANIFEST_OUTPUT_FILE_PATH = "./assignments_auto.tf"
