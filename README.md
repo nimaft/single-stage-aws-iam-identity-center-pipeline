@@ -88,6 +88,20 @@ This solution splits out management of permission sets used by Management/Root a
 
 To reconcile where a resource belongs to, this solutions establishes a naming convention to distinguish between targets: the identifier `MGMTACCT` is used to indicate JSON files that are part of the management account. Files without the string `MGMTACCT` are assumed to be managed by the delegated administrator account. The validation stage of the pipeline will ensure that `MGMTACCT` permission sets are not assigned to non-management accounts, and that non-`MGMTACCT` permission sets are not assigned to the management account.
 
+## Running the tests
+
+The Python scripts have unit tests alongside them in the `terraform` folder. Every test mocks its boto3 clients, so no AWS credentials and no network access are required.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+cd terraform && python3 -m unittest discover -p "*_test.py" -v
+```
+
+Running from the `terraform` folder is required: the test modules import the scripts by bare module name (eg. `import resolve_permission_sets_and_assignments`).
+
+These tests run automatically on every pull request via `.github/workflows/python-tests.yaml` (and in the GitLab example's `test` stage).
+
 ## Pipeline Overview
 
 This is a typical Terraform pipeline, except that the main files (`permission_sets_auto.tf` and `assignments_auto.tf`) are generated dynamically from source JSON/YAML files.
