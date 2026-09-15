@@ -925,8 +925,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fail-on-types",
+        # nargs="+" keeps this a list. Without it, a supplied value is a string, and
+        # the membership test in validate_policies becomes a substring test.
+        nargs="+",
         default=["ERROR"],
-        help="The types of policy findings that should cause the script to fail.",
+        help="The types of policy findings that should cause the script to fail. Add SECURITY_WARNING to fail on security findings as well as errors.",
     )
     return parser
 

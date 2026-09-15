@@ -177,56 +177,90 @@ def validate_assignments_have_unique_identifiers(assignments_templates):
 #     return errors
 
 
+# Client error codes that indicate a problem with the template, rather than a problem
+# with the caller's permissions or with the service. These are reported as findings.
+# Any other client error is re-raised: a validator that reports "policy not found"
+# when it actually cannot read IAM would be worse than a crash.
+TEMPLATE_ERROR_CODES = ("NoSuchEntity", "InvalidInput", "ValidationError")
+
+
+def build_customer_policy_arn(account_id: str, path: str, policy_name: str) -> str:
+    """
+    Builds the ARN of a customer managed policy from its account, path and name.
+
+    The path is normalised to start and end with a slash, because an IAM policy ARN
+    always has exactly one slash between "policy" and the path.
+    """
+    normalised_path = str(path or "/").strip("/")
+    if normalised_path:
+        normalised_path = f"/{normalised_path}/"
+    else:
+        normalised_path = "/"
+    return f"arn:aws:iam::{account_id}:policy{normalised_path}{policy_name}"
+
+
 def validate_managed_policies_arn(permission_set_object, current_account_id):
     """
     Returns a list of errors in managed policies and permission boundaries.
     """
     errors = []
-    permission_set_name = permission_set_object["Name"]
+    permission_set_name = permission_set_object.get("Name", "<unnamed permission set>")
 
     client = boto3.client("iam")
-    try:
-        # This basically checks whether the managed policy exists
-        log.info(
-            f"Analyzing the permission set managed policies for permission set {permission_set_name}."
-        )
-        for each_managed_policy in permission_set_object["ManagedPolicies"]:
+    log.info(
+        f"Analyzing the permission set managed policies for permission set {permission_set_name}."
+    )
+    # ManagedPolicies is optional: a permission set may instead use only
+    # CustomerManagedPolicies or only CustomPolicy.
+    for each_managed_policy in permission_set_object.get("ManagedPolicies", []):
+        # The loop body handles its own errors so that one bad policy does not stop
+        # the remaining policies from being checked.
+        try:
+            # This basically checks whether the managed policy exists
             _ = client.get_policy(PolicyArn=each_managed_policy)
-    # Handle when resource is not found
-    except ClientError as error:
-        if error.response["Error"]["Code"] == "NoSuchEntity":
-            error_string = (
-                f"[{permission_set_name}] An issue was found in the managed policy. Reason: "
-                + str(error)
-            )
-            log.error(error_string)
-            errors.append(error_string)
-        else:
-            # Unknown Client Error
-            raise error
+        # Handle when resource is not found
+        except ClientError as error:
+            if error.response["Error"]["Code"] in TEMPLATE_ERROR_CODES:
+                error_string = (
+                    f"[{permission_set_name}] An issue was found in the managed policy "
+                    f"'{each_managed_policy}'. Reason: " + str(error)
+                )
+                log.error(error_string)
+                errors.append(error_string)
+            else:
+                # Unknown Client Error
+                raise error
 
-    try:
-        log.info(
-            f"[{permission_set_name}] Analyzing permission boundary policies from permission set"
-        )
-        customer_permission_boundary_object = permission_set_object.get(
-            "CustomerPermissionBoundary", {}
-        )
-        if re.match(r"^arn:aws", customer_permission_boundary_object.get("Name", "")):
-            error_string = f"[{permission_set_name}] You specified an permission boundary ARN instead of name. Please specify a name."
-            log.error(error_string)
-            errors.append(error_string)
-        elif customer_permission_boundary_object:
-            _ = client.get_policy(
-                PolicyArn=f"arn:aws:iam::{current_account_id}:policy/{customer_permission_boundary_object['Path']}{customer_permission_boundary_object['Name']}"
-            )
-    except Exception as error:
-        error_string = (
-            f"[{permission_set_name}] An issue was found in the AWS managed permission boundary policy. Reason: "
-            + str(error)
-        )
+    log.info(
+        f"[{permission_set_name}] Analyzing permission boundary policies from permission set"
+    )
+    customer_permission_boundary_object = permission_set_object.get(
+        "CustomerPermissionBoundary", {}
+    )
+    if re.match(r"^arn:aws", customer_permission_boundary_object.get("Name", "")):
+        error_string = f"[{permission_set_name}] You specified an permission boundary ARN instead of name. Please specify a name."
         log.error(error_string)
         errors.append(error_string)
+    elif customer_permission_boundary_object:
+        # Path is optional, and the resolver defaults a missing Path to "/".
+        boundary_arn = build_customer_policy_arn(
+            account_id=current_account_id,
+            path=customer_permission_boundary_object.get("Path", "/"),
+            policy_name=customer_permission_boundary_object["Name"],
+        )
+        try:
+            _ = client.get_policy(PolicyArn=boundary_arn)
+        except ClientError as error:
+            if error.response["Error"]["Code"] in TEMPLATE_ERROR_CODES:
+                error_string = (
+                    f"[{permission_set_name}] An issue was found in the customer managed "
+                    f"permission boundary policy '{boundary_arn}'. Reason: " + str(error)
+                )
+                log.error(error_string)
+                errors.append(error_string)
+            else:
+                # Unknown Client Error
+                raise error
     return errors
 
 
@@ -373,8 +407,14 @@ def main(
         return False
 
     # Policies
+    # Pass the configured path through: validate_policies has its own default, so a
+    # custom permission_set_templates_path previously matched no files at all and the
+    # inline policy check silently passed.
     policy_errors = validate_policies(
         fail_on_types=fail_on_types,
+        permission_sets_path_identifier=os.path.join(
+            permission_set_templates_path, "*.json"
+        ),
     )
     if policy_errors:
         log.error("Policies failed validation. Review findings and correct them:")
@@ -407,7 +447,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--fail-on-types",
-        default=["SECURITY_WARNING", "ERROR"],
+        # nargs="+" keeps this a list. Without it, a supplied value is a string, and
+        # the membership test in validate_policies becomes a substring test.
+        nargs="+",
+        default=["ERROR"],
         help="The types of policy findings that should cause the script to fail.",
     )
     args = parser.parse_args()
